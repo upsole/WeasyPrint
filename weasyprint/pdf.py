@@ -90,7 +90,8 @@ def _create_compressed_file_object(source):
     pdf_file_object = PdfDict(
         Type=PdfName('EmbeddedFile'), Filter=PdfName('FlateDecode'))
 
-    # pdfrw needs Latin-1-decoded unicode strings in object.stream
+    # pdfrw needs Latin-1-decoded unicode strings in object.stream with Python
+    # 3, and bytes for Python 2
     pdf_file_object.stream = ''
     size = 0
     for data in iter(lambda: source.read(4096), b''):
@@ -98,6 +99,8 @@ def _create_compressed_file_object(source):
         md5.update(data)
         pdf_file_object.stream += compress.compress(data).decode('latin-1')
     pdf_file_object.stream += compress.flush(zlib.Z_FINISH).decode('latin-1')
+    if sys.version_info[0] < 3:
+        pdf_file_object.stream = pdf_file_object.stream.encode('latin-1')
     pdf_file_object.Params = PdfDict(
         CheckSum=PdfString('<{}>'.format(md5.hexdigest())), Size=size)
     return pdf_file_object
