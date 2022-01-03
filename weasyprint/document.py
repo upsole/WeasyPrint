@@ -16,8 +16,6 @@ from os.path import basename
 from urllib.parse import unquote, urlsplit
 
 import pydyf
-from fontTools import subset
-from fontTools.ttLib import TTFont, TTLibError, ttFont
 
 from . import CSS, Attachment, __version__
 from .css import get_all_computed_styles
@@ -31,7 +29,7 @@ from .images import get_image_from_uri as original_get_image_from_uri
 from .layout import LayoutContext, layout_document
 from .layout.percent import percentage
 from .logger import LOGGER, PROGRESS_LOGGER
-from .text.ffi import ffi, harfbuzz, pango
+from .text.ffi import ffi, harfbuzz, harfbuzz_subset, pango
 from .text.fonts import FontConfiguration
 from .urls import URLFetchingError
 
@@ -70,7 +68,7 @@ class Font:
     def __init__(self, font_hash, file_content, pango_font, index):
         pango_metrics = pango.pango_font_get_metrics(pango_font, ffi.NULL)
         hb_font = pango.pango_font_get_hb_font(pango_font)
-        hb_face = harfbuzz.hb_font_get_face(hb_font)
+        self.hb_face = harfbuzz.hb_font_get_face(hb_font)
         self._font_description = pango.pango_font_describe(pango_font)
         self.family = ffi.string(pango.pango_font_description_get_family(
             self._font_description))
@@ -84,7 +82,6 @@ class Font:
 
         self.file_content = file_content
         self.index = index
-        self.file_hash = hash(file_content + bytes(index))
         self.hash = ''.join(
             chr(65 + letter % 26) for letter in sha.digest()[:6])
         self.name = (
@@ -100,14 +97,30 @@ class Font:
                 font_size * 1000)
         else:
             self.ascent = self.descent = 0
-        self.upem = harfbuzz.hb_face_get_upem(hb_face)
-        self.png = harfbuzz.hb_ot_color_has_png(hb_face)
-        self.svg = harfbuzz.hb_ot_color_has_svg(hb_face)
+        self.upem = harfbuzz.hb_face_get_upem(self.hb_face)
+        self.png = harfbuzz.hb_ot_color_has_png(self.hb_face)
+        self.svg = harfbuzz.hb_ot_color_has_svg(self.hb_face)
         self.stemv = 80
         self.stemh = 80
         self.bbox = [0, 0, 0, 0]
         self.widths = {}
         self.cmap = {}
+
+        # Use an empty font for emojis, with empty glyphs to keep text
+        # selection but emojis actually displayed as images.
+        if self.png or self.svg:
+            hb_blob = harfbuzz.hb_blob_create_from_file(
+                b'/tmp/untitled1.ttf')
+            self.hb_face = harfbuzz.hb_face_create(hb_blob, 0)
+            hb_blob = ffi.gc(
+                harfbuzz.hb_face_reference_blob(self.hb_face),
+                harfbuzz.hb_blob_destroy)
+            length = ffi.new('unsigned int *')
+            hb_data = harfbuzz.hb_blob_get_data(hb_blob, length)
+            self.file_content = ffi.unpack(hb_data, int(length[0]))
+
+        self.file_hash = hash(self.file_content + bytes(index))
+        self.format = 'otf' if file_content[:4] == b'OTTO' else 'ttf'
 
     @property
     def flags(self):
@@ -1334,58 +1347,50 @@ class Document:
                 fonts_by_file_hash[font.file_hash].append(font)
             else:
                 fonts_by_file_hash[font.file_hash] = [font]
+
         font_references_by_file_hash = {}
         for file_hash, fonts in fonts_by_file_hash.items():
             content = fonts[0].file_content
+            emoji_font = fonts[0].png or fonts[0].svg
 
-            if 'fonts' in self._optimize_size:
+            if emoji_font or 'fonts' in self._optimize_size:
                 # Optimize font
-                cmap = {}
-                for font in fonts:
-                    cmap = {**cmap, **font.cmap}
-                full_font = io.BytesIO(content)
-                optimized_font = io.BytesIO()
-                try:
-                    ttfont = TTFont(full_font, fontNumber=fonts[0].index)
-                    options = subset.Options(
-                        retain_gids=True, passthrough_tables=True,
-                        ignore_missing_glyphs=True, notdef_glyph=True)
-                    subsetter = subset.Subsetter(options)
-                    subsetter.populate(gids=cmap)
-                    subsetter.subset(ttfont)
-                    ttfont.save(optimized_font)
-                    content = optimized_font.getvalue()
-                except TTLibError:
+                hb_subset_input = ffi.gc(
+                    harfbuzz_subset.hb_subset_input_create_or_fail(),
+                    harfbuzz_subset.hb_subset_input_destroy)
+                harfbuzz_subset.hb_subset_input_set_flags(
+                    hb_subset_input,
+                    harfbuzz_subset.HB_SUBSET_FLAGS_RETAIN_GIDS)
+                hb_set = harfbuzz_subset.hb_subset_input_glyph_set(
+                    hb_subset_input)
+                codepoints = set().union(*[set(font.cmap) for font in fonts])
+
+                if emoji_font:
+                    # Remove emoji tables
+                    for table in (b'CBDT', b'CBLC', b'SVG '):
+                        harfbuzz_subset.hb_set_add(
+                            harfbuzz_subset.hb_subset_input_set(
+                                hb_subset_input,
+                                harfbuzz_subset.HB_SUBSET_SETS_DROP_TABLE_TAG),
+                            harfbuzz.hb_tag_from_string(table, -1))
+                    # Keeping one codepoint after the higher codepoint clears
+                    # all the codepoints below. That’s what we want for emojis.
+                    codepoints = (max(codepoints) + 1,)
+
+                for codepoint in codepoints:
+                    harfbuzz_subset.hb_set_add(hb_set, codepoint)
+                hb_subset_face = harfbuzz_subset.hb_subset_or_fail(
+                    fonts[0].hb_face, hb_subset_input)
+                if fonts[0].hb_face == ffi.NULL:
                     LOGGER.warning('Unable to optimize font')
+                else:
+                    hb_blob = ffi.gc(
+                        harfbuzz.hb_face_reference_blob(hb_subset_face),
+                        harfbuzz.hb_blob_destroy)
+                    hb_data = harfbuzz.hb_blob_get_data(hb_blob, stream.length)
+                    content = ffi.unpack(hb_data, int(stream.length[0]))
 
-            if fonts[0].png or fonts[0].svg:
-                # Add empty glyphs instead of PNG or SVG emojis
-                full_font = io.BytesIO(content)
-                try:
-                    ttfont = TTFont(full_font, fontNumber=fonts[0].index)
-                    if 'loca' not in ttfont or 'glyf' not in ttfont:
-                        ttfont['loca'] = ttFont.getTableClass('loca')()
-                        ttfont['glyf'] = ttFont.getTableClass('glyf')()
-                        ttfont['glyf'].glyphOrder = ttfont.getGlyphOrder()
-                        ttfont['glyf'].glyphs = {
-                            name: ttFont.getTableModule('glyf').Glyph()
-                            for name in ttfont['glyf'].glyphOrder}
-                    else:
-                        for glyph in ttfont['glyf'].glyphs:
-                            ttfont['glyf'][glyph] = (
-                                ttFont.getTableModule('glyf').Glyph())
-                    for table_name in ('CBDT', 'CBLC', 'SVG '):
-                        if table_name in ttfont:
-                            del ttfont[table_name]
-                    output_font = io.BytesIO()
-                    ttfont.save(output_font)
-                    content = output_font.getvalue()
-                except TTLibError:
-                    LOGGER.warning('Unable to save emoji font')
-
-            # Include font
-            font_type = 'otf' if content[:4] == b'OTTO' else 'ttf'
-            if font_type == 'otf':
+            if fonts[0].format == 'otf':
                 font_extra = pydyf.Dictionary({'Subtype': '/OpenType'})
             else:
                 font_extra = pydyf.Dictionary({'Length1': len(content)})
@@ -1401,7 +1406,6 @@ class Document:
                     current_widths = pydyf.Array()
                     widths.append(current_widths)
                 current_widths.append(font.widths[i])
-            font_type = 'otf' if font.file_content[:4] == b'OTTO' else 'ttf'
             font_descriptor = pydyf.Dictionary({
                 'Type': '/FontDescriptor',
                 'FontName': font.name,
@@ -1414,15 +1418,15 @@ class Document:
                 'CapHeight': font.bbox[3],
                 'StemV': font.stemv,
                 'StemH': font.stemh,
-                (f'FontFile{"3" if font_type == "otf" else "2"}'):
+                (f'FontFile{3 if font.format == "otf" else 2}'):
                     font_references_by_file_hash[font.file_hash],
             })
-            if font_type == 'otf':
+            if font.format == 'otf':
                 font_descriptor['Subtype'] = '/OpenType'
             pdf.add_object(font_descriptor)
             subfont_dictionary = pydyf.Dictionary({
                 'Type': '/Font',
-                'Subtype': f'/CIDFontType{"0" if font_type == "otf" else "2"}',
+                'Subtype': f'/CIDFontType{0 if font.format == "otf" else 2}',
                 'BaseFont': font.name,
                 'CIDSystemInfo': pydyf.Dictionary({
                     'Registry': pydyf.String('Adobe'),
