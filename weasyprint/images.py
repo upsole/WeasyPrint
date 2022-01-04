@@ -12,7 +12,8 @@ from itertools import cycle
 from xml.etree import ElementTree
 
 import pydyf
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from .layout.percent import percentage
 from .logger import LOGGER
